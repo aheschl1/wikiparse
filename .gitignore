@@ -1,0 +1,7 @@
+.env
+.models/
+extracted/
+extracted_full/
+__pycache__/
+*.egg-info/
+*.bz2
