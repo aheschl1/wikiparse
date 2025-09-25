@@ -43,6 +43,11 @@ class ColBertV2(Encoder):
         )
 
     def encode(self, texts: list[str]) -> torch.Tensor:
+        """
+        Encode texts in batches
+        
+        Returns a tensor of shape (len(texts), max_tokens, hidden_size)
+        """
         if len(texts) == 0:
             raise ValueError("No texts to encode.")
         output = None
@@ -50,11 +55,12 @@ class ColBertV2(Encoder):
             inputs = self.tokenize(texts[i:i+self.config.max_batch_size])
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
             with torch.no_grad():
-                outputs = self.model(**inputs)
-            if output is None:
-                output = outputs.last_hidden_state.cpu().detach()
-            else:
-                output = torch.cat((output, outputs.last_hidden_state.cpu().detach()), dim=0)
+                outputs: torch.Tensor = self.model(**inputs).last_hidden_state
+                # l2 normalize the output embeddings
+                # shape [B, N, D]
+                outputs = torch.nn.functional.normalize(outputs, p=2, dim=-1).cpu().detach()
+                
+            output = torch.cat((output, outputs), dim=0) if output else outputs
         return output # type: ignore     is logically sound
 
 class Scorer(ABC):
