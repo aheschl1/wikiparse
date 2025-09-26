@@ -1,7 +1,7 @@
 import pytest
 from pathlib import Path
 from wikindex.wiki.wiki import WikiFile, WikiDataset
-from wikindex.custom_colbert.model import ColBertV2
+from wikindex.custom_colbert.model import ColBert
 from wikindex.config import Config
 
 @pytest.fixture
@@ -22,7 +22,7 @@ def tmp_wiki_file(tmp_path: Path):
     return f
 
 def test_parse_file(tmp_wiki_file):
-    wf = WikiFile(tmp_wiki_file, encoder=ColBertV2(), config=Config(max_tokens=32))
+    wf = WikiFile(tmp_wiki_file, encoder=ColBert(), config=Config(max_tokens=32))
     assert "First" in wf.docs
     assert "Second" in wf.docs
 
@@ -37,6 +37,6 @@ def test_wiki_set(tmp_path: Path, tmp_wiki_file):
     subdir.mkdir()
     (subdir / "wiki_00").write_text(tmp_wiki_file.read_text())
 
-    ws = WikiDataset(tmp_path, encoder=ColBertV2(), config=Config(max_tokens=32))
+    ws = WikiDataset(tmp_path, encoder=ColBert(), config=Config(max_tokens=32))
     assert "First" in ws.docs
     assert "Second" in ws.docs

@@ -1,11 +1,11 @@
 import pytest
 from wikindex.wiki.wiki import WikiDoc
 from wikindex.config import Config
-from wikindex.custom_colbert.model import ColBertV2
+from wikindex.custom_colbert.model import ColBert
 
 @pytest.fixture(scope="module")
 def encoder():
-    return ColBertV2()
+    return ColBert()
 
 def test_short_content_fits_in_one_chunk(encoder):
     content = "This is a short paragraph."

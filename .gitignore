@@ -2,7 +2,9 @@
 .models/
 extracted/
 extracted_full/
+output/
 __pycache__/
 *.egg-info/
 *.bz2
 .pytest_cache/
+*.db

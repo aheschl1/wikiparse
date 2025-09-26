@@ -3,7 +3,7 @@ from pathlib import Path
 from wikindex.config import Config
 from wikindex.data.dataset import Datapoint, Dataset, TextDatapoint
 from wikindex.data.index import Index
-from wikindex.custom_colbert.model import ColBertScorer, ColBertV2
+from wikindex.custom_colbert.model import ColBertScorer, ColBert
 
 
 def get_config():
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     ]
     datapoints = {i: TextDatapoint(id=i, text=text) for i, text in enumerate(texts)}
     dataset = Dataset(datapoints)
-    encoder = ColBertV2(config=config)
+    encoder = ColBert(config=config)
     print(f"Number of documents in dataset: {len(dataset)}")
     scorer = ColBertScorer(config=config)
     index = Index(dataset, encoder, scorer, config=config)

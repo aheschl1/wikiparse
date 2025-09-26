@@ -6,7 +6,7 @@ from wikindex.config import Config
 
 class Encoder:
     @abstractmethod
-    def encode(self, texts: list[str]) -> torch.Tensor:
+    def encode(self, texts: list[str], is_query: bool = False) -> torch.Tensor:
         pass
     
     @abstractmethod
@@ -18,7 +18,7 @@ class Encoder:
     def tokenizer(self) -> PreTrainedTokenizerBase:
         pass
 
-class ColBertV2(Encoder):
+class ColBert(Encoder):
     def __init__(
         self, 
         config: Config = Config(),
@@ -42,7 +42,7 @@ class ColBertV2(Encoder):
             return_tensors='pt'
         )
 
-    def encode(self, texts: list[str]) -> torch.Tensor:
+    def encode(self, texts: list[str], is_query: bool = False) -> torch.Tensor:
         """
         Encode texts in batches
         
@@ -58,7 +58,7 @@ class ColBertV2(Encoder):
                 outputs: torch.Tensor = self.model(**inputs).last_hidden_state
                 # l2 normalize the output embeddings
                 # shape [B, N, D]
-                outputs = torch.nn.functional.normalize(outputs, p=2, dim=-1).cpu().detach()
+                outputs = torch.nn.functional.normalize(outputs, p=2, dim=-1).cpu().detach().to(torch.float16)
                 
             output = torch.cat((output, outputs), dim=0) if output else outputs
         return output # type: ignore     is logically sound
