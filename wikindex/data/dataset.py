@@ -1,6 +1,6 @@
 
 from abc import ABC, abstractmethod
-from typing import Mapping, Sequence
+from typing import Mapping, Sequence, Union
 
 from pydantic import BaseModel
 from wikindex.config import Config
@@ -10,7 +10,7 @@ from pathlib import Path
 class Datapoint(ABC, BaseModel):
     
     text: str
-    id: int
+    id: Union[int, None]
     
     @property
     @abstractmethod

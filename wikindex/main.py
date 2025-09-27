@@ -17,7 +17,7 @@ if __name__ == "__main__":
     texts = [
         "This is a test sentence. Now, it is even longer than before. fkdskl, dfksajfhkj",
         "Another test sentence for encoding.",
-        "flasdkfl",
+        "Fred hates to code.",
         "Andrew is a person who loves to test code."
     ]
     datapoints = {i: TextDatapoint(id=i, text=text) for i, text in enumerate(texts)}
@@ -28,7 +28,7 @@ if __name__ == "__main__":
     index = Index(dataset, encoder, scorer, config=config)
     index.build()
     print("Embedding dataset...")
-    query = "Who likes programming?"
+    query = "Who enjoys programming?"
     scores, indices = index.search(query, top_k=2)
     print("Top scores:", scores)
     print("Top indices:", indices)

@@ -1,12 +1,14 @@
 from pathlib import Path
 from re import compile
 import re
+from typing import Literal, Union
+from urllib.parse import unquote
 from pydantic import BaseModel, Field
 import html
 from glob import glob
-import pandas as pd
+import click
 
-from wikindex.wiki.sqlite import DB_URL, Client, Document, Chunk, FileRecord
+from wikindex.wiki.sqlite import DEFAULT_DB_URL, TRANSACTION_BATCH_SIZE, Client, Document, Chunk, FileRecord, document_links
 
 from wikindex.config import Config
 from wikindex.custom_colbert.model import ColBert, Encoder
@@ -15,15 +17,23 @@ import logging
 
 from wikindex.data.dataset import Datapoint, Dataset
 
-from multiprocessing import Queue
+from multiprocessing import Queue, Process, Manager
+from multiprocessing.pool import ThreadPool
+from tqdm import tqdm
 
 logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
+
+
+class Task(BaseModel):
+    task: Literal["doc", "chunk", "file"]
+    content: Union["WikiDoc", "ChunkDatapoint", str]
+    
 class ChunkDatapoint(Datapoint, BaseModel):
     text: str
-    id: int
+    id: Union[int, None]
     doc_id: int = Field(..., description="The id of the document.")
 
     @property
@@ -40,9 +50,9 @@ class WikiDoc(BaseModel):
     links: list[str] = Field(default_factory=list, description="List of titles of referenced docs.")
     file_path: str = Field(default="", description="The file path where the document is located.")
     
-    def get_datapoints(self, ids: list[int]):
-        for i, chunk in enumerate(self.chunks):
-            yield ChunkDatapoint(text=chunk, doc_id=self.id, id=ids[i])
+    def get_datapoints(self):
+        for chunk in self.chunks:
+            yield ChunkDatapoint(text=chunk, doc_id=self.id, id=None)
 
     def __len__(self):
         return len(self.chunks)
@@ -94,7 +104,7 @@ class WikiDoc(BaseModel):
                 chunks.append(tokenizer.convert_tokens_to_string(buffer))
 
         return chunks
-
+    
 DOC_PATTERN = re.compile(
     r'<doc id="(?P<id>\d+)" url="(?P<url>[^"]+)" title="(?P<title>[^"]+)">(?P<content>.*?)</doc>',
     re.DOTALL
@@ -116,12 +126,14 @@ def clean_content(raw: str) -> tuple[str, list[str]]:
     text = re.sub(r'<[^>]+>', '', text)  # remove other HTML tags
     return text, references
 
+
+
 class WikiFile:
-    def __init__(self, path: Path, encoder: Encoder, config: Config = Config()):
+    def __init__(self, path: Path, encoder: Encoder, tasks_queue: Queue, config: Config = Config()):
         self._path = path
         self.config = config
         self.encoder = encoder
-        self.docs, self.title_to_id = self._parse()
+        self._tasks_queue = tasks_queue
 
     @property
     def path(self) -> str:
@@ -130,8 +142,7 @@ class WikiFile:
     def _load_text(self) -> str:
         return self._path.read_text(encoding='utf-8')
 
-    def _parse(self) -> tuple[dict[int, WikiDoc], dict[int, str]]:
-        docs = {}
+    def parse(self):
         title_to_id = {}
         for match in DOC_PATTERN.finditer(self._load_text()):
             doc_id, url, title, raw_content = (
@@ -141,7 +152,7 @@ class WikiFile:
                 match["content"].strip(),
             )
             content, references = clean_content(raw_content)
-            docs[doc_id] = WikiDoc(
+            doc = WikiDoc(
                 id=doc_id,
                 url=url,
                 title=title,
@@ -149,177 +160,142 @@ class WikiFile:
                 links=references,
                 file_path=self.path
             )
+            self._tasks_queue.put(Task(task="doc", content=doc))
+            for datapoint in doc.get_datapoints():
+                self._tasks_queue.put(Task(task="chunk", content=datapoint))
             title_to_id[title] = doc_id
-        return docs, title_to_id
+        return title_to_id
 
 class WikiDataset(Dataset):
-    def __init__(self, root: Path, encoder: Encoder, config: Config = Config()):
+    def __init__(
+        self, 
+        root: Path, 
+        tasks_queue: Queue,
+        client: Client,
+        encoder: Encoder, 
+        consumer_processes: int = 1,
+        config: Config = Config()
+    ):
         self.root = root
         self.config = config
         self.encoder = encoder
+        self._client = client
+        self._tasks_queue = tasks_queue
+        self.consumer_processes = consumer_processes
         self._datapoints = None
-
-        self.files: dict[str, WikiFile] = self._load_files()
-        self.docs, self.title_to_id = self._collect_docs()
-
-    def _load_files(self) -> dict[str, WikiFile]:
-        files = {}
-        for path in map(Path, glob(str(self.root / "*" / "*_*"))):
+    
+    def parse(self):
+        
+        def process_file(path: Path):
             wf = WikiFile(
-                path, encoder=self.encoder, config=self.config
+                path, encoder=self.encoder,
+                tasks_queue=self._tasks_queue,
+                config=self.config
             )
-            files[wf.path] = wf
-        return files
+            wf.parse()
+            self._tasks_queue.put(Task(
+                task="file",
+                content=wf.path
+            ))
 
-    def _collect_docs(self) -> tuple[dict[int, WikiDoc], dict[str, int]]:
-        docs = {doc.id: doc for wf in self.files.values() for doc in wf.docs.values()}        
-        title_to_id = {}
-        for f in self.files.values():
-            title_to_id.update(f.title_to_id)
-        return docs, title_to_id
-
-    def save(self, output_dir: Path):
-        """
-        Save mapping of datapoint IDs to (doc title, chunk index) for reference.
-        write to csv with columns: id, doc_title, chunk_index
-        """
-        chunk_data = {
-            "id": [],
-            "doc_id": []
-        }
-        doc_data = {
-            "id": [],
-            "title": [],
-            "file_path": []
-        }
-        for datapoint in self.datapoints.values():
-            chunk_data["id"].append(int(datapoint.id))
-            chunk_data["doc_id"].append(datapoint.metadata["doc_id"])
+        paths = map(Path, glob(str(self.root / "*" / "*_*")))
+        paths = [p for p in paths if not self._client.session.get(FileRecord, f"{p.parent.name} / {p.name}")]
+        logger.info(f"Found {len(paths)} files to process in {self.root}")
         
-        for fpath, file in self.files.items():
-            for doc in file.docs.values():
-                doc_data["id"].append(doc.id)
-                doc_data["title"].append(doc.title)
-                doc_data["file_path"].append(fpath)
-        
-        chunk_df = pd.DataFrame(chunk_data)
-        doc_df = pd.DataFrame(doc_data)
-        chunk_df.to_csv(output_dir / "datapoints.csv", index=False)
-        doc_df.to_csv(output_dir / "documents.csv", index=False)
+        with ThreadPool(processes=self.consumer_processes) as pool, tqdm(total=len(paths), desc="Processing files") as pbar:
+            for _ in pool.imap(process_file, paths):
+                pbar.update()
+                pbar.refresh()
         
     @property
     def datapoints(self) -> dict[int, Datapoint]:
-        if self._datapoints:
-            return self._datapoints
-        points = {}
-        base_id = 0
-        for doc in self.docs.values():
-            ids = list(range(base_id, base_id + len(doc)))
-            for dp in doc.get_datapoints(ids):
-                points[dp.id] = dp
-            base_id += len(doc)
-        # cache it
-        self._datapoints = points
-        return points
+        raise NotImplementedError("Datapoints are handled via queue in this implementation.")
 
-BATCH_SIZE = 1000
-
-def document_consumer(docs: Queue[WikiDoc], client: Client):
-    run = True
-    while run:
-        batch = []
-        for _ in range(BATCH_SIZE):
-            doc = docs.get()
-            if doc is None:
-                run = False
+def consumer(tasks: Queue, db_url: str):
+    with Client(db_url) as client:
+        run = True
+        while run:
+            batch = {
+                "doc": [],
+                "chunk": [],
+                "file": []
+            }
+            for _ in range(TRANSACTION_BATCH_SIZE):
+                task: Task = tasks.get()
+                if task is None:
+                    run = False
+                    break
+                batch[task.task].append(task.content)
+            if not any(batch.values()):
                 break
-            batch.append(doc)
-        if not batch:
-            break
-        client.session.add_all([Document(
-            id=doc.id,
-            title=doc.title,
-            url=doc.url,
-            file_path=doc.file_path,
-        ) for doc in batch])
-        client.session.commit()
+            if batch["doc"]:
+                client.session.add_all([Document(
+                    id=doc.id,
+                    title=doc.title,
+                    url=doc.url,
+                    file_path=doc.file_path,
+                ) for doc in batch["doc"]])
+                # add links
+                for doc in batch["doc"]:
+                    if not doc.title:
+                        raise ValueError("Document title cannot be empty when adding links.")
+                    for link in doc.links:
+                        if not link:
+                            raise ValueError("Link title cannot be empty when adding links.")
+                    link_rows = [
+                        {"from_title": doc.title, "to_title": unquote(fid)}
+                        for fid in doc.links if doc.title and doc.links
+                    ]
+                    if link_rows:
+                        client.session.execute(document_links.insert(), link_rows)
+            if batch["chunk"]:
+                client.session.add_all([Chunk(
+                    doc_id=point.doc_id,
+                    content=point.text
+                ) for point in batch["chunk"]])
+            if batch["file"]:
+                client.session.add_all([FileRecord(path=fpath) for fpath in batch["file"]])
+            client.session.commit()
+            
+def preprocess(root: Path, db_url: str = DEFAULT_DB_URL, consumer_processes: int = 1):
+    config = Config(device="cpu")
+    encoder = ColBert(config=config, tokenizer_only=True)
+    
+    tasks_queue: Queue = Queue()
 
-def chunk_consumer(chunks: Queue[ChunkDatapoint], client: Client):
-    run = True
-    while run:
-        batch = []
-        for _ in range(BATCH_SIZE):
-            chunk = chunks.get()
-            if chunk is None:
-                run = False
-                break
-            batch.append(chunk)
-        if not batch:
-            break
-        client.session.add_all([Chunk(
-            doc_id=point.doc_id,
-            content=point.text
-        ) for point in batch])
-        client.session.commit()
+    tasks_process = Process(target=consumer, args=(tasks_queue, db_url))
+    tasks_process.start()
 
-
-def preprocess(root: Path, encoder: Encoder):
     logger.info(f"Starting preprocessing of Wiki dataset at {root}")
-    wset = WikiDataset(root, encoder=encoder)
-    logger.info(f"Loaded {len(wset.files)} files with {len(wset.docs)} documents and {len(wset.datapoints)} chunks.")
-    with Client(DB_URL) as client:
-        # upload files
-        logger.info(f"Uploading {len(wset.files)} files to the database.")
-        client.session.add_all([FileRecord(
-            path=fpath.path
-        ) for fpath in wset.files.values()])
-        client.session.commit()
-        # upload documents
-        logger.info(f"Uploading {len(wset.docs)} documents to the database.")
-        client.session.add_all([Document(
-            id=doc.id,
-            title=doc.title,
-            url=doc.url,
-            file_path=doc.file_path,
-        ) for doc in wset.docs.values()])
-        client.session.commit()
-        # update links
-        logger.info(f"Updating document links in the database.")
-        for doc in wset.docs.values():
-            db_doc = client.session.get(Document, doc.id)
-            assert db_doc, f"Document with id {doc.id} not found in DB."
-            linked_docs = [
-                linked for lid in doc.links
-                if (linked := client.session.query(Document).filter(
-                    Document.title == lid
-                ).first()) is not None
-            ]
-            db_doc.links = linked_docs
-        client.session.commit()
-        # upload chunks
-        logger.info(f"Uploading {len(wset.datapoints)} chunks to the database.")
-        client.session.add_all([Chunk(
-            doc_id=point.id,
-            content=point.text
-        ) for point in wset.datapoints.values()])
-        client.session.commit()
+
+    with Client(db_url) as client:
+        wset = WikiDataset(
+            root, 
+            encoder=encoder, 
+            client=client, 
+            tasks_queue=tasks_queue,
+            consumer_processes=consumer_processes,
+            config=config
+        )
+        wset.parse()
+    # signal consumers to finish
+    tasks_queue.put(None)
+    tasks_process.join()
+
+@click.command()
+@click.argument('root', type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option('--db-name', '--db', type=str, default=DEFAULT_DB_URL, help="Database URL or file name for SQLite.")
+@click.option('--consumer-processes', '--cp', type=int, default=8, help="Number of consumer processes to use.")
+def main(root: Path, db_name: str, consumer_processes: int):
+    if not db_name.startswith("sqlite:///"):
+        db_url = f"sqlite:///{db_name}"
+    else:
+        db_url = db_name
+    preprocess(root, db_url, consumer_processes)
 
 if __name__ == "__main__":
-    # root = Path("/home/andrew/Documents/wikiparse/extracted")
-    # wset = WikiDataset(root, encoder=ColBert())
-
-    # wset.save(Path("./output"))
-    
-    # example_doc = wset.files["AA/wiki_00"].docs["Wallacea angulicollis"]
-    # print(example_doc.chunks)
-    # print(f"Loaded {len(wset.files)} files.")
-
-    # # Inspect a file
-    # for file_key, wfile in list(wset.files.items())[666:667]:
-    #     print(f"File: {file_key} has {len(wfile.docs)} documents.")
-    #     doc = next(iter(wfile.docs.values()))
-    #     print(f"Document: {doc.title} has chunks:")
-    #     for chunk in doc.chunks:
-    #         print(f"- {chunk}")
-    
-    preprocess(Path("/home/andrew/Documents/wikiparse/extracted_full"), encoder=ColBert())
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    )
+    main()

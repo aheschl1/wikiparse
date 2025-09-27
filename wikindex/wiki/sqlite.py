@@ -3,32 +3,34 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.types import JSON, Integer, String
 from sqlalchemy import Column, ForeignKey, Table
 
-DB_URL = "sqlite:///wikindex.db"
+DEFAULT_DB_URL = "sqlite:///wikindex.db"
+TRANSACTION_BATCH_SIZE = 10000
 
 Base = declarative_base()
 
 document_links = Table(
     "document_links",
     Base.metadata,
-    Column("from_id", ForeignKey("documents.id"), primary_key=True),
-    Column("to_id", ForeignKey("documents.id"), primary_key=True),
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("from_title", ForeignKey("documents.title"), nullable=False, index=True),
+    Column("to_title", ForeignKey("documents.title"), nullable=False, index=True),
 )
     
 class FileRecord(Base):
     __tablename__ = 'files'
-    path = Column(String, primary_key=True, unique=True)
+    path = Column(String, primary_key=True)
 
 class Document(Base):
     __tablename__ = 'documents'
-    id = Column(Integer, primary_key=True, autoincrement=False)
-    title = Column(String, unique=True, index=True)
+    id = Column(Integer, primary_key=True)
+    title = Column(String, unique=True, index=True, nullable=False)
     url = Column(String)
     
     links = relationship(
         "Document",
         secondary=document_links,
-        primaryjoin=id == document_links.c.from_id,
-        secondaryjoin=id == document_links.c.to_id,
+        primaryjoin=title == document_links.c.from_title,
+        secondaryjoin=title == document_links.c.to_title,
         backref="linked_from"
     )
     # foreign file

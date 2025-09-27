@@ -5,7 +5,6 @@ from wikindex.config import Config
 from wikindex.data.dataset import Dataset
 from wikindex.custom_colbert.model import Encoder, Scorer
 import faiss
-import numpy as np
 
 class Index:
     def __init__(self, dataset: Dataset, encoder: Encoder, scorer: Scorer, config: Config = Config()):
@@ -23,7 +22,7 @@ class Index:
         if not top_k:
             top_k = self.config.top_k
         query_embedding = self.encoder.encode([query])
-        scores = self.scorer.score(query_embedding, self.embeddings)
+        scores = self.scorer.score(self.scorer.pad_embeddings(query_embedding), self.scorer.pad_embeddings(self.embeddings))
         scores, indices = scores.topk(top_k)
         return scores, [self.dataset[i] for i in indices.tolist()]
     

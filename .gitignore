@@ -8,3 +8,5 @@ __pycache__/
 *.bz2
 .pytest_cache/
 *.db
+*.html
+*.db-journal
