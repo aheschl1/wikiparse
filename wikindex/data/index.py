@@ -11,8 +11,8 @@ from wikindex.data.dataset import Datapoint, Dataset
 from wikindex.custom_colbert.model import ColBert, ColBertScorer, Encoder, Scorer
 import faiss
 
-from wikindex.wiki.sqlite import DEFAULT_DB_URL, Client, Shard
-from wikindex.wiki.wiki import WikiDataset
+from wikindex.wiki.sqlite import DEFAULT_DB_URL, Chunk, Client, Shard
+from wikindex.wiki.wiki import ChunkDatapoint, WikiDataset
 import numpy as np
 from tqdm import tqdm
 class Index:
@@ -93,7 +93,50 @@ class FaissIndex(Index):
             ])
             self.client.session.commit()
         logging.info("Sharding complete.")
-                
+    
+    def _index_batch(
+        self, 
+        datapoints: list[Datapoint],
+        index: faiss.Index,
+    ):
+        tensors = [torch.load(self.embeddings_folder / f"{dp.id}.pt") for dp in datapoints]
+        catted = torch.cat(tensors, dim=0).cpu()
+        ids = []
+        for i, dp in enumerate(datapoints):
+            ids.extend([dp.id] * tensors[i].shape[0])
+        indices = torch.tensor(ids, device=catted.device)
+        index.add_with_ids(catted.numpy(), indices.numpy()) # type: ignore
+    
+    def _index_shard(self, shard_id: int):
+        assert self.client is not None, "Client must be provided to load the index."
+        index = self.shard_manager.load_shard(shard_id)
+        if index is None:
+            logging.warning(f"Shard {shard_id} not found.")
+            return
+        # Load the corresponding datapoints for this shard
+        query = self.client.session.query(Chunk).join(Shard, Chunk.id == Shard.chunk_id).filter(Shard.shard_id == shard_id)
+        batch = []
+        for row in query.yield_per(100):
+            datapoint = ChunkDatapoint(text=row.content, id=row.id, doc_id=row.doc_id) # type: ignore
+            batch.append(datapoint)
+            if len(batch) >= self.config.max_batch_size:
+                self._index_batch(batch, index)
+                batch = []
+        if batch:
+            self._index_batch(batch, index)
+
+        self.shard_manager.close_shard(index, shard_id)
+
+    def build_index(self):
+        if self.client is None:
+            raise ValueError("Client must be provided to shard the index.")
+        unique_shards = self.client.session.query(Shard.shard_id).distinct().all() 
+        shard_ids = [shard_id for (shard_id,) in unique_shards]
+        logging.info(f"Loading {len(shard_ids)} shards into Faiss index.")
+        for i, shard_id in enumerate(tqdm(shard_ids, desc="Loading shards")):
+            # for each shard id, we need to populate it
+            self._index_shard(shard_id)
+
     @staticmethod
     def load(
         dataset: Dataset,
@@ -187,6 +230,12 @@ class ShardManager:
         if not shard_path.exists():
             raise ValueError(f"Shard {shard_id} does not exist at {shard_path}.")
         return faiss.read_index(str(shard_path))
+    
+    def close_shard(self, index: faiss.Index, shard_id: int):
+        shard_path = self.root / f"shard_{shard_id}.index"
+        faiss.write_index(index, str(shard_path))
+        logging.info(f"Saved shard {shard_id} to {shard_path}.")
+        index.reset()
         
 
 
