@@ -7,5 +7,7 @@ class Config(BaseModel):
     device: str = 'cuda'
     cache_dir: str = "./.models"
     model_tag: str = "colbert-ir/colbertv2.0"
-    max_batch_size: int = 798
-    top_k: int = 5
+    max_batch_size: int = 850
+    top_k: int = 10
+    top_k_prefetch: int = 1024
+    projected_dim: int = 128

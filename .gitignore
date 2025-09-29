@@ -10,3 +10,5 @@ __pycache__/
 *.db
 *.html
 *.db-journal
+.embeddings*
+index_small

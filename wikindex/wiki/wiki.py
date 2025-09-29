@@ -1,12 +1,16 @@
 from pathlib import Path
 from re import compile
 import re
+from threading import Thread
+import time
 from typing import Literal, Union
 from urllib.parse import unquote
 from pydantic import BaseModel, Field
 import html
 from glob import glob
 import click
+import sqlalchemy
+import torch
 
 from wikindex.wiki.sqlite import DEFAULT_DB_URL, TRANSACTION_BATCH_SIZE, Client, Document, Chunk, FileRecord, document_links
 
@@ -34,13 +38,11 @@ class Task(BaseModel):
 class ChunkDatapoint(Datapoint, BaseModel):
     text: str
     id: Union[int, None]
-    doc_id: int = Field(..., description="The id of the document.")
+    doc_id: Union[int, None] = None
 
     @property
     def metadata(self) -> dict:
-        return {
-            "doc_id": self.doc_id,
-        }
+        return {}
 
 class WikiDoc(BaseModel):
     id: int = Field(..., description="The unique identifier for the document.")
@@ -52,7 +54,7 @@ class WikiDoc(BaseModel):
     
     def get_datapoints(self):
         for chunk in self.chunks:
-            yield ChunkDatapoint(text=chunk, doc_id=self.id, id=None)
+            yield ChunkDatapoint(text=chunk, id=None, doc_id=self.id)
 
     def __len__(self):
         return len(self.chunks)
@@ -170,7 +172,7 @@ class WikiDataset(Dataset):
     def __init__(
         self, 
         root: Path, 
-        tasks_queue: Queue,
+        tasks_queue: Union[Queue, None],
         client: Client,
         encoder: Encoder, 
         consumer_processes: int = 1,
@@ -184,32 +186,93 @@ class WikiDataset(Dataset):
         self.consumer_processes = consumer_processes
         self._datapoints = None
     
+    @staticmethod
+    def from_sqlite(
+        client: Client,
+        encoder: Encoder,
+        config: Config = Config()
+    ) -> "WikiDataset":
+        return WikiDataset(
+            root=Path("."),
+            tasks_queue=None,
+            client=client,
+            encoder=encoder,
+            config=config
+    )
+    
     def parse(self):
-        
+        assert self._tasks_queue is not None, "Tasks queue must be provided for parsing."
         def process_file(path: Path):
             wf = WikiFile(
                 path, encoder=self.encoder,
-                tasks_queue=self._tasks_queue,
+                tasks_queue=self._tasks_queue, # type: ignore
                 config=self.config
             )
             wf.parse()
-            self._tasks_queue.put(Task(
+            self._tasks_queue.put(Task( # type: ignore
                 task="file",
                 content=wf.path
             ))
 
-        paths = map(Path, glob(str(self.root / "*" / "*_*")))
+        paths = [Path(x) for x in glob(str(self.root / "*" / "*_*"))]
+        total_path = len(paths)
         paths = [p for p in paths if not self._client.session.get(FileRecord, f"{p.parent.name} / {p.name}")]
-        logger.info(f"Found {len(paths)} files to process in {self.root}")
+        logger.info(f"Found {len(paths)} / {total_path} files to process in {self.root}")
         
         with ThreadPool(processes=self.consumer_processes) as pool, tqdm(total=len(paths), desc="Processing files") as pbar:
             for _ in pool.imap(process_file, paths):
                 pbar.update()
                 pbar.refresh()
+    
+    def __getitem__(self, idx) -> Union[Datapoint, list[Datapoint]]:
+        if isinstance(idx, int):
+            row: Chunk = self._client.session.get(Chunk, idx)
+            if not row:
+                raise IndexError(f"Index {idx} out of range.")
+            return ChunkDatapoint(text=row.content, id=row.id, doc_id=row.doc_id) # type: ignore
+        elif isinstance(idx, slice):
+            start = idx.start or 0
+            stop = idx.stop or self.__len__()
+            stop = min(stop, self.__len__())
+            if start < 0 or stop < 0 or start >= self.__len__() or stop > self.__len__() or start >= stop:
+                raise IndexError(f"Slice {idx} out of range.")
+            rows = self._client.session.execute(
+                sqlalchemy.select(Chunk).where(
+                    Chunk.id >= start,
+                    Chunk.id < stop
+                )
+            ).scalars().all()
+            return [ChunkDatapoint(text=row.content, id=row.id, doc_id=row.doc_id) for row in rows] # type: ignore
+        else:
+            raise TypeError("Index must be int or slice.")
         
+    def __iter__(self):
+        for rows in self._client.session.execute(sqlalchemy.select(Chunk)).yield_per(100):
+            for row in rows:
+                yield ChunkDatapoint(text=row.content, id=row.id, doc_id=row.doc_id)
+    
+    def __len__(self):
+        count = self._client.session.execute(sqlalchemy.select(sqlalchemy.func.count(Chunk.id))).scalar_one()
+        return count
+
     @property
     def datapoints(self) -> dict[int, Datapoint]:
-        raise NotImplementedError("Datapoints are handled via queue in this implementation.")
+        return {row.id: ChunkDatapoint(text=row.content, id=row.id, doc_id=row.doc_id) for row in self._client.session.execute(sqlalchemy.select(Chunk)).scalars()} # type: ignore
+
+def try_commit_all(session, items):
+    try:
+        session.add_all(items)
+        session.commit()
+    except Exception as e:
+        logger.error(f"Error adding items: {e}")
+        for item in items:
+            try:
+                session.add(item)
+                session.commit()
+            except Exception as e:
+                logger.error(f"Error adding item {type(item)}: {e}")
+                session.rollback()
+        session.commit()
 
 def consumer(tasks: Queue, db_url: str):
     with Client(db_url) as client:
@@ -229,12 +292,7 @@ def consumer(tasks: Queue, db_url: str):
             if not any(batch.values()):
                 break
             if batch["doc"]:
-                client.session.add_all([Document(
-                    id=doc.id,
-                    title=doc.title,
-                    url=doc.url,
-                    file_path=doc.file_path,
-                ) for doc in batch["doc"]])
+                try_commit_all(client.session, [Document(title=x.title, id=x.id, url=x.url) for x in batch["doc"]])
                 # add links
                 for doc in batch["doc"]:
                     if not doc.title:
@@ -248,15 +306,12 @@ def consumer(tasks: Queue, db_url: str):
                     ]
                     if link_rows:
                         client.session.execute(document_links.insert(), link_rows)
+                client.session.commit()
             if batch["chunk"]:
-                client.session.add_all([Chunk(
-                    doc_id=point.doc_id,
-                    content=point.text
-                ) for point in batch["chunk"]])
+                try_commit_all(client.session, [Chunk(doc_id=x.doc_id, content=x.text) for x in batch["chunk"]])
             if batch["file"]:
-                client.session.add_all([FileRecord(path=fpath) for fpath in batch["file"]])
-            client.session.commit()
-            
+                try_commit_all(client.session, [FileRecord(path=fpath) for fpath in batch["file"]])
+
 def preprocess(root: Path, db_url: str = DEFAULT_DB_URL, consumer_processes: int = 1):
     config = Config(device="cpu")
     encoder = ColBert(config=config, tokenizer_only=True)
@@ -265,6 +320,8 @@ def preprocess(root: Path, db_url: str = DEFAULT_DB_URL, consumer_processes: int
 
     tasks_process = Process(target=consumer, args=(tasks_queue, db_url))
     tasks_process.start()
+    
+    time.sleep(1)
 
     logger.info(f"Starting preprocessing of Wiki dataset at {root}")
 
@@ -281,18 +338,56 @@ def preprocess(root: Path, db_url: str = DEFAULT_DB_URL, consumer_processes: int
     # signal consumers to finish
     tasks_queue.put(None)
     tasks_process.join()
+    
+
+def _build_batch(datapoints: list[Datapoint], encoder: Encoder, embeddings_folder: Path):
+    def write():
+        for i, embd in enumerate(embeddings):
+            id = datapoints[i].id
+            torch.save(embd.cpu().to(torch.float16), embeddings_folder / f"{id}.pt")
+    embeddings = encoder.encode([x.text for x in datapoints], is_query=False)
+    thread = Thread(target=write)
+    thread.start()
+    return thread
+
+def embed_dataset(dataset: WikiDataset, encoder: Encoder, output_folder: Path):
+    max_threads = 1000
+    batch = []
+    threads = []
+    for datapoint in dataset:
+        while len(threads) > max_threads:
+            threads.pop(0).join()
+            
+        batch.append(datapoint)
+        if len(batch) >= dataset.config.max_batch_size:
+            threads.append(_build_batch(batch, encoder, output_folder))
+            batch = []
+    if batch:
+        threads.append(_build_batch(batch, encoder, output_folder))
+    for thread in threads:
+        thread.join()
 
 @click.command()
 @click.argument('root', type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option('--db-name', '--db', type=str, default=DEFAULT_DB_URL, help="Database URL or file name for SQLite.")
 @click.option('--consumer-processes', '--cp', type=int, default=8, help="Number of consumer processes to use.")
-def main(root: Path, db_name: str, consumer_processes: int):
+@click.option('--extract', is_flag=True, default=False, help="Whether to extract the sqlite.")
+@click.option('--embed', is_flag=True, default=False, help="Whether to embed the dataset after preprocessing.")
+def main(root: Path, db_name: str, consumer_processes: int, extract: bool, embed: bool):
     if not db_name.startswith("sqlite:///"):
         db_url = f"sqlite:///{db_name}"
     else:
         db_url = db_name
-    preprocess(root, db_url, consumer_processes)
+    if extract:
+        preprocess(root, db_url, consumer_processes)
+    if embed:
+        with Client(db_url) as client:
+            config = Config(device="cuda")
+            encoder = ColBert(config=config, tokenizer_only=False)
+            dataset = WikiDataset.from_sqlite(client, encoder, config)
+            embed_dataset(dataset, encoder, root)
 
+        
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,

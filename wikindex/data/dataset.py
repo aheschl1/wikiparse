@@ -30,13 +30,16 @@ class Dataset:
     def __len__(self):
         return len(self.datapoints)
 
-    def __getitem__(self, idx) -> Datapoint:
+    def __getitem__(self, idx) -> Union[Datapoint, list[Datapoint]]:
         return self.datapoints[idx]
+    
+    def __iter__(self):
+        yield from self.datapoints.values()
 
     def embed(self, encoder: Encoder):
-        return encoder.encode(self.texts)
+        return encoder.encode(self.texts, is_query=False)
 
     @property
     def texts(self) -> list[str]:
-        return [dp.text for dp in self.datapoints.values()]
+        return [dp.text for dp in self]
     
