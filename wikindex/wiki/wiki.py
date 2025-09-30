@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from re import compile
 import re
@@ -354,7 +355,9 @@ def embed_dataset(dataset: WikiDataset, encoder: Encoder, output_folder: Path):
     max_threads = 1000
     batch = []
     threads = []
-    for datapoint in dataset:
+    for datapoint in tqdm(dataset, total=len(dataset), desc="Embedding datapoints"):
+        if os.path.exists(output_folder / f"{datapoint.id}.pt"):
+            continue
         while len(threads) > max_threads:
             threads.pop(0).join()
             
@@ -366,7 +369,7 @@ def embed_dataset(dataset: WikiDataset, encoder: Encoder, output_folder: Path):
         threads.append(_build_batch(batch, encoder, output_folder))
     for thread in threads:
         thread.join()
-
+ 
 @click.command()
 @click.argument('root', type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option('--db-name', '--db', type=str, default=DEFAULT_DB_URL, help="Database URL or file name for SQLite.")

@@ -45,10 +45,6 @@ class Chunk(Base):
 
     document = relationship("Document", backref="chunks")
 
-class Shard(Base):
-    __tablename__ = 'shards'
-    chunk_id = Column(ForeignKey('chunks.id'), primary_key=True)
-    shard_id = Column(Integer, index=True, nullable=False)
 
 class Client:
     def __init__(self, db_url: str):
