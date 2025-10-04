@@ -12,6 +12,10 @@ class Encoder:
         pass
     
     @abstractmethod
+    def encode_tokens(self, inputs: dict[str, torch.Tensor], is_query: bool) -> list[torch.Tensor]:
+            pass
+    
+    @abstractmethod
     def tokenize(self, texts: list[str], is_query: bool) -> dict:
         pass
     
@@ -75,6 +79,27 @@ class ColBert(Encoder):
         attention_mask = (tokens != self._tokenizer.pad_token_id).long()
         return {"input_ids": tokens, "attention_mask": attention_mask}
 
+    def encode_tokens(self, inputs: dict[str, torch.Tensor], is_query: bool) -> list[torch.Tensor]:
+        """
+        Encode pre-tokenized inputs
+        
+        Returns a tensor of shape (B, max_tokens, hidden_size)
+        """
+        assert self.model is not None, "Model not loaded."
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        with torch.no_grad():
+            outputs: torch.Tensor = self.model(**inputs).last_hidden_state
+            outputs = self._projection(outputs)
+            # l2 normalize the output embeddings
+            # shape [B, N, D]
+            outputs = torch.nn.functional.normalize(outputs, p=2, dim=-1).cpu().detach()
+            if not is_query:
+                punctuation_mask = ~torch.isin(inputs['input_ids'].cpu(), self._skip_list)
+                output_masked = [d[punctuation_mask[i]] for i, d in enumerate(outputs)]
+            else:
+                output_masked = [d for d in outputs]
+        return output_masked
+    
     def encode(self, texts: list[str], is_query: bool) -> list[torch.Tensor]:
         """
         Encode texts in batches

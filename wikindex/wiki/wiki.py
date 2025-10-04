@@ -256,9 +256,34 @@ class WikiDataset(Dataset):
         count = self._client.session.execute(sqlalchemy.select(sqlalchemy.func.count(Chunk.id))).scalar_one()
         return count
 
+    def ids(self, no_exist: Union[Path, None]) -> list[int]:
+        if no_exist:
+            ids = [row for row in self._client.session.execute(sqlalchemy.select(Chunk.id)).scalars() if not (no_exist / f"{row}.pt").exists()] # type: ignore
+            return ids
+        return [row for row in self._client.session.execute(sqlalchemy.select(Chunk.id)).scalars()] # type: ignore
+
     @property
     def datapoints(self) -> dict[int, Datapoint]:
         return {row.id: ChunkDatapoint(text=row.content, id=row.id, doc_id=row.doc_id) for row in self._client.session.execute(sqlalchemy.select(Chunk)).scalars()} # type: ignore
+
+class WikiPytorchDataset(torch.utils.data.Dataset):
+    def __init__(
+        self, 
+        dataset: WikiDataset,
+        output_folder: Union[Path, None] = None
+    ):
+        self.ids = dataset.ids(no_exist=output_folder)
+        self.dataset = dataset
+    
+    def __len__(self):
+        return len(self.ids)
+    
+    def __getitem__(self, idx) -> tuple[Datapoint, dict[str, torch.Tensor]]:
+        idx = self.ids[idx]
+        datapoint = self.dataset[idx]
+        assert isinstance(datapoint, ChunkDatapoint)
+        return datapoint, self.dataset.encoder.tokenize([datapoint.text], is_query=False)
+        
 
 def try_commit_all(session, items):
     try:
@@ -339,37 +364,64 @@ def preprocess(root: Path, db_url: str = DEFAULT_DB_URL, consumer_processes: int
     # signal consumers to finish
     tasks_queue.put(None)
     tasks_process.join()
-    
 
-def _build_batch(datapoints: list[Datapoint], encoder: Encoder, embeddings_folder: Path):
-    def write():
-        for i, embd in enumerate(embeddings):
-            id = datapoints[i].id
-            torch.save(embd.cpu().to(torch.float16), embeddings_folder / f"{id}.pt")
-    embeddings = encoder.encode([x.text for x in datapoints], is_query=False)
-    thread = Thread(target=write)
-    thread.start()
-    return thread
+def _save_embeddings(tensors: list[torch.Tensor], datapoints: list[Datapoint], path: Path):
+    for i, embd in enumerate(tensors):
+        id = datapoints[i].id
+        torch.save(embd, path / f"{id}.pt")
 
-def embed_dataset(dataset: WikiDataset, encoder: Encoder, output_folder: Path):
-    max_threads = 1000
-    batch = []
-    threads = []
-    for datapoint in tqdm(dataset, total=len(dataset), desc="Embedding datapoints"):
-        if os.path.exists(output_folder / f"{datapoint.id}.pt"):
-            continue
-        while len(threads) > max_threads:
-            threads.pop(0).join()
+def embed_dataset(dataset: WikiDataset, encoder: Encoder, output_folder: Path, cp: int = 8):
+    # max_threads = 1000
+    # batch = []
+    # threads = []
+    # for datapoint in tqdm(dataset, total=len(dataset), desc="Embedding datapoints"):
+    #     if os.path.exists(output_folder / f"{datapoint.id}.pt"):
+    #         continue
+    #     while len(threads) > max_threads:
+    #         threads.pop(0).join()
             
-        batch.append(datapoint)
-        if len(batch) >= dataset.config.max_batch_size:
-            threads.append(_build_batch(batch, encoder, output_folder))
-            batch = []
-    if batch:
-        threads.append(_build_batch(batch, encoder, output_folder))
-    for thread in threads:
-        thread.join()
- 
+    #     batch.append(datapoint)
+    #     if len(batch) >= dataset.config.max_batch_size:
+    #         threads.append(_build_batch(batch, encoder, output_folder))
+    #         batch = []
+    # if batch:
+    #     threads.append(_build_batch(batch, encoder, output_folder))
+    # for thread in threads:
+    #     thread.join()
+    processes = []
+    logger.info(f"Embedding dataset to {output_folder}. Preparing dataloader...")
+    datatset = WikiPytorchDataset(dataset, output_folder=output_folder)
+    def collate_fn(batch):
+        datapoints, inputs = zip(*batch)
+        return datapoints, {
+            "input_ids": torch.vstack([item["input_ids"] for item in inputs]),
+            "attention_mask": torch.vstack([item["attention_mask"] for item in inputs])
+        }
+    dataloader = torch.utils.data.DataLoader(
+        datatset,
+        batch_size=dataset.config.max_batch_size,
+        shuffle=False,
+        num_workers=(os.cpu_count() or cp) - 1,
+        pin_memory=True,
+        collate_fn=collate_fn
+    )
+    start = time.time()
+    for (datapoints, batch) in tqdm(dataloader, total=len(dataloader), desc="Embedding datapoints"):
+        embeddings = encoder.encode_tokens(batch, is_query=False)
+        embeddings = [embedding.cpu().to(torch.float16).share_memory_() for embedding in embeddings]
+        p = Process(target=_save_embeddings, args=(embeddings, datapoints, output_folder))
+        p.start()
+        processes.append(p)
+        if len(processes) >= cp:
+            logger.info("Letting writing processes finish...")
+            while len(processes) > cp//2:
+                processes.pop(0).join()
+            if time.time() - start > 3600:
+                time.sleep(120)  # let things cool down a bit - in particular for HDDs
+                start = time.time()
+    for p in processes:
+        p.join()
+
 @click.command()
 @click.argument('root', type=click.Path(exists=True, file_okay=False, path_type=Path))
 @click.option('--db-name', '--db', type=str, default=DEFAULT_DB_URL, help="Database URL or file name for SQLite.")
@@ -388,7 +440,7 @@ def main(root: Path, db_name: str, consumer_processes: int, extract: bool, embed
             config = Config(device="cuda")
             encoder = ColBert(config=config, tokenizer_only=False)
             dataset = WikiDataset.from_sqlite(client, encoder, config)
-            embed_dataset(dataset, encoder, root)
+            embed_dataset(dataset, encoder, root, cp=consumer_processes)
 
         
 if __name__ == "__main__":

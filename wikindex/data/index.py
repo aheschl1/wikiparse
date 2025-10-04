@@ -56,7 +56,15 @@ class FaissIndex(Index):
         self, 
         datapoints: list[Datapoint]
     ):
-        tensors = [torch.load(self.embeddings_folder / f"{dp.id}.pt") for dp in datapoints]
+        # tensors = [torch.load(self.embeddings_folder / f"{dp.id}.pt") for dp in datapoints]
+        tensors = []
+        for dp in datapoints:
+            try:
+                tensor = torch.load(self.embeddings_folder / f"{dp.id}.pt")
+                tensors.append(tensor)
+            except Exception as e:
+                logging.warning(f"Could not load embedding for datapoint {dp.id}: {e}")
+                
         catted = torch.cat(tensors, dim=0).cpu()
         dp_ids = []
         for i, dp in enumerate(datapoints):
@@ -152,7 +160,7 @@ class ShardManager:
         self.nlist = 4096        # number of coarse clusters (tunable)
         self.m = 32              # subquantizers (dim should be divisible by m)
         self.nbits = 8           # bits per subquantizer (2^8 = 256 centroids each)
-        self.ntrain = 70_000    
+        self.ntrain = 100_000    
 
     @property
     def quantizer(self):
@@ -170,10 +178,19 @@ class ShardManager:
         logging.info("Sampling embeddings for PQ training...")
         sample_indices = np.random.choice(len(dataset), size=min(self.ntrain, len(dataset)), replace=False)
         train_samples = []
+        failures = 0
+        print(f"Success: 0 | Failures: 0 | Remaining: {len(sample_indices)} | Total: {len(sample_indices)}", end="\r")
         for idx in sample_indices:
             idx = max(1, int(idx)) # the assigned sql ids start at 1
-            train_samples.append(torch.load(embeddings_folder / f"{idx}.pt"))
+            try:
+                train_samples.append(torch.load(embeddings_folder / f"{idx}.pt"))
+            except Exception as e:
+                failures += 1
+            # remove old print statement
+            print(f"Success: {len(train_samples)} | Failures: {failures} | Remaining: {len(sample_indices) - len(train_samples) - failures} | Total: {len(sample_indices)}", end="\r")
 
+        logging.info(f"Loaded {len(train_samples)} training samples, {failures} failures.")
+        
         sample = torch.cat(train_samples, dim=0).numpy()
         logging.info(f"Training index on {sample.shape[0]} samples...")
         index.train(sample)  # type: ignore
@@ -240,14 +257,14 @@ def main(root: Path, embeddings_path: Path, db_url: str, train: bool):
             shard_manager=shard_manager,
             client=client
         )
-        # index.build(train=train)
+        index.build(train=train)
         # index.shard_index()
         # index = FaissIndex.load(dataset, encoder, scorer, config=config, index_path="./faiss.index")
-        while True:
-            q = input("Enter query (or 'exit' to quit): ")
-            if q.lower() in ("exit", "quit"):
-                break
-            print(index.search(q))
+        # while True:
+        #     q = input("Enter query (or 'exit' to quit): ")
+        #     if q.lower() in ("exit", "quit"):
+        #         break
+        #     print(index.search(q))
 
 if __name__ == "__main__":
     main()
